@@ -660,6 +660,7 @@ interface V4aChunk {
   oldLines: string[];
   addTexts: string[];
   toEof: boolean;
+  fromMarker: boolean; // started by an @@ line or a *** End of File line, not by a body line
 }
 
 interface V4aSection {
@@ -687,15 +688,22 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
   const sections: V4aSection[] = [];
   let cur: V4aSection | null = null;
   let chunk: V4aChunk | null = null;
+  // whitespace-only lines inside an Add section: held until the next line
+  // tells whether they are blank lines at the section's end (not part of it)
+  // or stray lines in its middle (a parse error at the first of them)
+  let addBlankLineNos: number[] = [];
 
-  const startChunk = (anchor: string | null): V4aChunk => {
-    const c: V4aChunk = { anchor, kinds: [], bare: [], oldLines: [], addTexts: [], toEof: false };
+  const startChunk = (anchor: string | null, fromMarker = false): V4aChunk => {
+    const c: V4aChunk = { anchor, kinds: [], bare: [], oldLines: [], addTexts: [], toEof: false, fromMarker };
     cur!.chunks.push(c);
     return c;
   };
 
   // blank lines at the end of an update section are not part of it: drop the
-  // trailing context rows of its last chunk that came from empty patch lines
+  // trailing context rows of its last chunk that came from empty patch lines.
+  // If nothing of that chunk remains and it was never a real chunk (no @@
+  // line, no *** End of File line — just those blank lines), drop it too, so
+  // a section left with no chunk at all is the parse error section 8 names.
   const closeUpdate = (s: V4aSection | null): void => {
     if (s === null || s.kind !== 'upd' || s.chunks.length === 0) return;
     const last = s.chunks[s.chunks.length - 1]!;
@@ -706,6 +714,9 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
         last.bare.pop();
         last.oldLines.pop();
       } else break;
+    }
+    if (last.kinds.length === 0 && last.addTexts.length === 0 && !last.fromMarker && !last.toEof) {
+      s.chunks.pop();
     }
   };
 
@@ -718,6 +729,7 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
       cur = { kind: 'add', path: line.slice('*** Add File: '.length).trim(), headerLine: lineNo, addLines: [], moveTo: null, chunks: [] };
       sections.push(cur);
       chunk = null;
+      addBlankLineNos = [];
       continue;
     }
     if (line.startsWith('*** Delete File: ')) {
@@ -725,6 +737,7 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
       cur = { kind: 'del', path: line.slice('*** Delete File: '.length).trim(), headerLine: lineNo, addLines: [], moveTo: null, chunks: [] };
       sections.push(cur);
       chunk = null;
+      addBlankLineNos = [];
       continue;
     }
     if (line.startsWith('*** Update File: ')) {
@@ -732,6 +745,7 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
       cur = { kind: 'upd', path: line.slice('*** Update File: '.length).trim(), headerLine: lineNo, addLines: [], moveTo: null, chunks: [] };
       sections.push(cur);
       chunk = null;
+      addBlankLineNos = [];
       continue;
     }
 
@@ -741,8 +755,11 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
     }
 
     if (cur.kind === 'add') {
-      if (line.startsWith('+')) cur.addLines.push(line.slice(1));
-      else if (line === '') cur.addLines.push('');
+      if (line.startsWith('+')) {
+        if (addBlankLineNos.length > 0) throw new Exit2(`error: parse ${addBlankLineNos[0]}`);
+        cur.addLines.push(line.slice(1));
+      } else if (line === '') cur.addLines.push('');
+      else if (isBlank(line)) addBlankLineNos.push(lineNo);
       else throw new Exit2(`error: parse ${lineNo}`);
       continue;
     }
@@ -761,11 +778,11 @@ function readV4a(lines: string[], strict: boolean): Edit[] {
     }
     if (line.startsWith('@@')) {
       const anchorText = line.slice(2).trim();
-      chunk = startChunk(anchorText === '' ? null : anchorText);
+      chunk = startChunk(anchorText === '' ? null : anchorText, true);
       continue;
     }
     if (line === '*** End of File') {
-      if (chunk === null) chunk = startChunk(null);
+      if (chunk === null) chunk = startChunk(null, true);
       chunk.toEof = true;
       chunk = null;
       continue;
@@ -847,16 +864,34 @@ function v4aEdit(sec: V4aSection, strict: boolean): Edit {
         continue;
       }
 
-      const hit = locate(work, ch.oldLines, cursor, strict);
       let at = -1;
       let tier = 0;
-      if (hit !== null) {
-        tier = hit.tier;
-        for (const s of hit.starts) {
-          if (!ch.toEof || s + ch.oldLines.length === work.length) {
-            at = s;
-            break;
+      if (ch.toEof) {
+        // An end-of-file chunk takes only an occurrence that ends at the
+        // file's last line: that single candidate position is tried at each
+        // tier in order, and the first tier at which it matches wins.
+        const s = work.length - ch.oldLines.length;
+        if (s >= cursor) {
+          const lastTier = strict ? 0 : 2;
+          for (let t = 0; t <= lastTier && at < 0; t++) {
+            let ok = true;
+            for (let j = 0; j < ch.oldLines.length; j++) {
+              if (!lineMatchesAtTier(work[s + j]!, ch.oldLines[j]!, t)) {
+                ok = false;
+                break;
+              }
+            }
+            if (ok) {
+              at = s;
+              tier = t;
+            }
           }
+        }
+      } else {
+        const hit = locate(work, ch.oldLines, cursor, strict);
+        if (hit !== null) {
+          tier = hit.tier;
+          at = hit.starts[0]!;
         }
       }
       if (at < 0) throw new EditFail('no-match', sec.path);
