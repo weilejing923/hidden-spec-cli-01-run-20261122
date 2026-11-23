@@ -39,12 +39,14 @@ function patchLines(text: string): string[] {
   return parts.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
 }
 
-/** Section 3: a safe relative path. */
+/** Section 3: a safe relative path. A NUL byte can never name a file, so a
+ *  path holding one is unsafe too (the fs layer would throw on it). */
 function pathIsSafe(p: string): boolean {
   return (
     p !== '' &&
     !p.startsWith('/') &&
     !p.includes('\\') &&
+    !p.includes('\0') &&
     p.split('/').every((seg) => seg !== '' && seg !== '.' && seg !== '..')
   );
 }
@@ -68,7 +70,10 @@ class Tree {
     if (!this.before.has(p)) {
       let v: string | null = null;
       try {
-        if (statSync(p).isFile()) v = readFileSync(p, 'utf8');
+        // A path that exists but is not a file (a directory) still occupies
+        // the path: reads see it as existing with no lines, so a create on
+        // it fails `exists` instead of crashing at write time.
+        v = statSync(p).isFile() ? readFileSync(p, 'utf8') : '';
       } catch {
         v = null;
       }
@@ -134,24 +139,51 @@ interface MatchHit {
 }
 
 /**
+ * Every start index >= `from` at which `needle` occurs in `hay`, overlaps
+ * included, ascending. Knuth-Morris-Pratt over the line arrays, so a needle
+ * that almost matches at every position (long runs of identical lines)
+ * still costs linear time instead of positions x needle length.
+ */
+function findStarts(hay: string[], needle: string[], from: number): number[] {
+  const starts: number[] = [];
+  const lo = Math.max(0, from);
+  if (needle.length === 0) {
+    for (let i = lo; i <= hay.length; i++) starts.push(i);
+    return starts;
+  }
+  if (needle.length > hay.length) return starts;
+  const pi = new Array<number>(needle.length).fill(0);
+  for (let i = 1; i < needle.length; i++) {
+    let j = pi[i - 1]!;
+    while (j > 0 && needle[i] !== needle[j]) j = pi[j - 1]!;
+    if (needle[i] === needle[j]) j++;
+    pi[i] = j;
+  }
+  let j = 0;
+  for (let i = lo; i < hay.length; i++) {
+    while (j > 0 && hay[i] !== needle[j]) j = pi[j - 1]!;
+    if (hay[i] === needle[j]) j++;
+    if (j === needle.length) {
+      starts.push(i - needle.length + 1);
+      j = pi[j - 1]!;
+    }
+  }
+  return starts;
+}
+
+/**
  * Find old lines `old` inside `hay` at or after index `from`. Tiers are tried
  * in order (tier 0 only when strict); the first tier with any hit wins.
- * Returns null when no tier matches.
+ * Returns null when no tier matches. Each tier compares pre-transformed
+ * copies of both sides (trailing/both ends stripped), which is exactly the
+ * per-line comparison of lineMatchesAtTier done once per line.
  */
 function locate(hay: string[], old: string[], from: number, strict: boolean): MatchHit | null {
   const lastTier = strict ? 0 : 2;
   for (let tier = 0; tier <= lastTier; tier++) {
-    const starts: number[] = [];
-    for (let i = Math.max(0, from); i + old.length <= hay.length; i++) {
-      let ok = true;
-      for (let j = 0; j < old.length; j++) {
-        if (!lineMatchesAtTier(hay[i + j]!, old[j]!, tier)) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) starts.push(i);
-    }
+    const th = tier === 0 ? hay : hay.map(tier === 1 ? stripTrail : stripBoth);
+    const to = tier === 0 ? old : old.map(tier === 1 ? stripTrail : stripBoth);
+    const starts = findStarts(th, to, from);
     if (starts.length > 0) return { tier, starts };
   }
   return null;
@@ -1023,10 +1055,16 @@ function run(args: string[]): { code: number; out: string[] } {
       const was = tree.original(p);
       const now = tree.state.get(p)!;
       if (was === now) continue;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
+      try {
+        if (now === null) rmSync(p, { force: true });
+        else {
+          mkdirSync(dirname(p), { recursive: true });
+          writeFileSync(p, now);
+        }
+      } catch {
+        // The path cannot be written as a file (a directory sits on it, a
+        // parent component is a file, the name is too long for the fs):
+        // leave the tree as it is rather than dying with a stack trace.
       }
     }
   }
